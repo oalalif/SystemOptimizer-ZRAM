@@ -1,0 +1,16 @@
+# Temporary files
+*.log
+*.tmp
+*.swp
+
+# System files
+*.bak
+*.cache
+
+# Editor files
+.vscode/
+.idea/
+
+# Local directories
+/tmp/
+/var/tmp/
