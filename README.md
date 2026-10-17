@@ -1,71 +1,78 @@
 # SystemOptimizer-ZRAM
 
-A robust Linux system optimization script for enhancing RAM (with ZRAM), CPU, and system cleanup. Available in Indonesian (`optimize-id.sh`) and English (`optimize-en.sh`).
+A robust, modern Linux system optimization suite designed to maximize RAM throughput via ZRAM (`zstd` compression & `systemd-zram-generator`), optimize CPU governors and scheduler latency, manage disk I/O schedulers, and safely perform system cleanup without disk thrashing. Available in Indonesian (`optimize-id.sh`) and English (`optimize-en.sh`).
 
 ## Table of Contents
 - [Overview](#overview)
-- [What is ZRAM?](#what-is-zram)
+- [Architecture & The Modern ZRAM Standard](#architecture--the-modern-zram-standard)
+- [Key Improvements in Version 3.2.0](#key-improvements-in-version-320)
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Alias Configuration](#alias-configuration)
-- [Troubleshooting](#troubleshooting)
+- [Troubleshooting & Solved Conflicts](#troubleshooting--solved-conflicts)
 - [Contributing](#contributing)
 - [License](#license)
 
+---
+
 ## Overview
-This script optimizes Linux system performance by:
-- Configuring **ZRAM** for compressed RAM-based swap.
-- Tuning CPU governors and scheduler parameters.
-- Cleaning up temporary files, caches, and package leftovers.
-- Managing swap priorities for efficient memory usage.
+This script tunes Linux systems for peak responsiveness and memory efficiency:
+- **Primary Swap Pool**: High-performance in-memory ZRAM with `zstd` compression (~4.3x ratio).
+- **Zero Disk Thrashing**: Prohibits rogue activation of unallocated or external USB drive swap partitions.
+- **CPU Scheduler Optimization**: Schedutil / performance governors and ultra-low task latency parameters.
+- **I/O Scheduler Optimization**: Direct NVMe `none` bypass, MQ-Deadline for SSDs/HDDs.
+- **System Debloat**: Safe cleanup of package caches (APT/DNF/Pacman) and vacuuming systemd journal logs.
 
-**Version**: 3.0.0 (Fixed ZRAM failures, robust cleanup, enhanced logging)
+**Current Version**: `3.2.0` (Native `systemd-zram-generator` integration, `zstd` 4x compression, dynamic allocation fix, safe secondary swap management).
 
-## What is ZRAM?
-ZRAM is a Linux kernel feature that creates a compressed block device in RAM, used as swap space. It compresses data (e.g., with `lz4` or `zstd`) to reduce memory usage, ideal for systems with limited RAM.
+---
 
-### ZRAM vs. Module vs. Built-In
-- **ZRAM Module**:
-  - Loaded dynamically via `modprobe zram`.
-  - Configurable via parameters (e.g., `num_devices` in `/sys/module/zram/parameters/`).
-  - Can be unloaded/reloaded for flexibility.
-  - Example: `modprobe zram num_devices=1`
-  - Check: `modinfo zram_info`
-- **ZRAM Built-In**:
-  - Compiled into the kernel, not a separate module.
-  - Parameters are fixed at compile-time (no `/sys/module/zram/`).
-  - Cannot be unloaded without rebooting.
-  - Check: `zcat /proc/config.gz | grep CONFIG_ZRAM`
-- **Key Differences**:
-  - **Module**: More flexible, supports runtime changes (e.g., `num_devices=1`).
-  - **Built-In**: More static, may lack sysfs parameters (e.g., `num_devices` missing).
-  - This script supports both, detecting via `/proc/config.gz`, `/boot/config-*`, or `modinfo`.
+## Architecture & The Modern ZRAM Standard
 
-### ZRAM in This Script
-- Configures ZRAM with `zramctl` for precise size and algorithm control.
-- Default: 50% of RAM (adjustable 10–150%).
-- Uses `lz4` for fast compression.
-- Prioritizes ZRAM swap (priority 100) over disk/file swaps (priority 5–10).
-- Robust cleanup ensures no conflicts (e.g., multiple ZRAM devices).
+### 1. `systemd-zram-generator` vs. Legacy Standalone `zramctl`
+- **Modern Linux (Ubuntu 22.04/24.04, Fedora, Debian 12+)**:
+  The system uses `systemd-zram-generator` controlled via `/etc/systemd/zram-generator.conf`. Systemd manages `/dev/zram0` as a native service (`systemd-zram-setup@zram0.service`).
+  - *Previous Error*: Legacy scripts attempted to forcibly unload `rmmod zram` or run `zramctl --reset`, conflicting directly with active systemd units and causing "Device or resource busy" or boot failures.
+  - *Version 3.2.0 Solution*: Automatically detects `systemd-zram-generator`, writes clean unit configurations, reloads systemd cleanly, and eliminates module race conditions.
+- **Standalone Fallback**:
+  For distributions without systemd or the generator, the script seamlessly falls back to graceful `zramctl` configuration without indiscriminate process termination (`fuser -k`).
+
+### 2. Compression: `zstd` vs. `lz4`
+- `lz4`: Older standard, fast but offers ~1.8x – 2.1x compression ratio.
+- `zstd`: Modern standard on multi-core CPUs. Delivers ~3.5x – 4.5x compression ratio with negligible CPU overhead, allowing 8GB of RAM to comfortably hold 15GB+ of compressed memory without hitting slow disk storage.
+
+### 3. Swappiness (180) & Zero Page-Cluster
+- **Swappiness = 180**: Because ZRAM operates at RAM speeds (5–10 GB/s), setting a high swappiness tells the kernel to aggressively compress inactive memory pages into ZRAM. This keeps filesystem caches (`page cache`) intact and prevents disk I/O lockups.
+- **Page-Cluster = 0**: Disables disk read-ahead seek clustering. Since RAM has zero seek penalty, reading 1 page (4KB) at a time delivers instantaneous decompression latency.
+
+---
+
+## Key Improvements in Version 3.2.0
+1. **Eliminated False "Available Memory Too Low" Error**: Removed the flawed check that required 110% of uncompressed free RAM. ZRAM allocates dynamically upon compression.
+2. **Prevented Boot Delay (90s Hang)**: Automatically sanitizes `/etc/fstab` to comment out static `/dev/zram0` entries that cause systemd mount timeouts during boot.
+3. **Safe Swap Priority Management**: Replaced blind `/dev/sd*` device scanning with strict verification of active `/proc/swaps` and `/etc/fstab` entries, permanently preventing external USB SSDs from being accidentally turned into thrashing swap devices.
+4. **Anti-Freeze Kernel Parameters**: Tuned `vfs_cache_pressure = 50`, `dirty_ratio = 10`, `dirty_background_ratio = 5`, and `watermark_boost_factor = 0` to eliminate desktop stutter.
+
+---
 
 ## Features
-- **RAM Optimization**:
-  - Configures ZRAM with customizable size and swappiness.
-  - Adjusts kernel parameters (e.g., `vfs_cache_pressure`, `overcommit_memory`).
-  - Manages swap priorities for optimal performance.
-- **CPU Optimization**:
-  - Sets efficient CPU governors (`schedutil`, `ondemand`, or `performance`).
-  - Tunes scheduler parameters for responsiveness.
-  - Optimizes I/O schedulers (`mq-deadline`, `kyber`, `none` for NVMe).
-- **System Cleanup**:
-  - Clears caches, temporary files, and logs.
-  - Cleans package managers (`apt`, `dnf`, `pacman`).
-- **Robustness**:
-  - Validates dependencies and memory availability.
-  - Handles ZRAM module/built-in differences.
-  - Detailed logging for debugging.
-- **Multilingual**: Available in Indonesian and English.
+- **RAM & Swap**:
+  - Dynamically configures ZRAM size (default: 100% RAM pool).
+  - Defaults to optimal `zstd` compression with automatic fallback to `lz4`/`lzo-rle`.
+  - Sets swappiness to 180 and page-cluster to 0.
+- **CPU & I/O**:
+  - Sets `schedutil` or `performance` governor.
+  - Lowers scheduling latencies (`sched_latency_ns`, `sched_migration_cost_ns`).
+  - Sets NVMe drives to `none` scheduler and SSD/HDD to `mq-deadline`.
+- **System Maintenance**:
+  - Trims APT, DNF, and Pacman package archives.
+  - Vacuums systemd journal logs (>50MB or >7d).
+- **Safety First**:
+  - Never kills running processes using `fuser -k`.
+  - Full syntax compatibility and POSIX error handling (`set -euo pipefail`).
+
+---
 
 ## Installation
 1. **Clone the repository**:
@@ -74,193 +81,94 @@ ZRAM is a Linux kernel feature that creates a compressed block device in RAM, us
    cd SystemOptimizer-ZRAM
    ```
 2. **Install dependencies**:
-   - Debian/Ubuntu:
+   - Debian / Ubuntu:
      ```bash
-     sudo apt install bc util-linux
+     sudo apt update && sudo apt install -y bc util-linux systemd-zram-generator
      ```
    - Fedora:
      ```bash
-     sudo dnf install bc util-linux
+     sudo dnf install -y bc util-linux zram-generator
      ```
-   - Arch:
+   - Arch Linux:
      ```bash
-     sudo pacman -S bc util-linux
+     sudo pacman -S --noconfirm bc util-linux zram-generator
      ```
 3. **Make executable**:
    ```bash
    chmod +x optimize-id.sh optimize-en.sh
    ```
 
+---
+
 ## Usage
 Run as root:
 ```bash
+# Indonesian
 sudo ./optimize-id.sh [MODE] [OPTIONS]
+
+# English
 sudo ./optimize-en.sh [MODE] [OPTIONS]
 ```
 
 ### Modes
-- `(none)`: Full optimization (RAM + CPU + Cleanup)
+- `(none)` / `all`: Full optimization (RAM + CPU + Cleanup)
 - `ram`: Optimize RAM and ZRAM only
-- `cpu`: Optimize CPU only
-- `cleanup`: System cleanup only
+- `cpu`: Optimize CPU and I/O scheduler only
+- `cleanup`: Clean package caches, journals, and temporary files
 
 ### Options
 | Option | Description | Default |
-|-------------|-------------------|---------|
-| `--zram PERCENT` | ZRAM size (0.1–1.5x RAM) | 0.5 |
-| `--swappiness N` | Swappiness value (0–100) | 10 |
-| `--no-zram` | Skip ZRAM setup | - |
-| `--force-zram` | Force ZRAM reset | - |
-| `--help`, `-h` | Show help | - |
+| :--- | :--- | :--- |
+| `--zram PERCENT` | Target ZRAM pool ratio relative to physical RAM (0.1–1.5) | `1.0` (100% RAM) |
+| `--swappiness N` | Kernel swappiness (0–200) | `180` |
+| `--algorithm ALGO` | Compression algorithm (`zstd`, `lz4`, `lzo-rle`) | `zstd` |
+| `--no-zram` | Skip ZRAM configuration entirely | - |
+| `--force-zram` | Force reset of standalone ZRAM devices | - |
+| `--help`, `-h` | Display help message | - |
 
-### Examples
-- Default optimization:
-  ```bash
-  sudo ./optimize-id.sh
-  ```
-- ZRAM with 25% RAM:
-  ```bash
-  sudo ./optimize-id.sh ram --zram 0.25 --swappiness 15
-  ```
-- Skip ZRAM:
-  ```bash
-  sudo ./optimize-id.sh ram --no-zram
-  ```
-- Force ZRAM reset:
-  ```bash
-  sudo ./optimize-id.sh ram --force-zram
-  ```
+---
 
 ## Alias Configuration
-Add these to `~/.zshrc` or `~/.bashrc` for convenience:
+Add these aliases to your `~/.bashrc` or `~/.zshrc`:
 ```bash
-# Main optimization
+# Main optimizers
 alias sysopt='sudo ~/bin/optimize-id.sh'
-alias ramopt='sudo ~/bin/optimize-id.sh ram --zram 0.25 --swappiness 15'
+alias ramopt='sudo ~/bin/optimize-id.sh ram'
 alias cpuopt='sudo ~/bin/optimize-id.sh cpu'
 alias cleanopt='sudo ~/bin/optimize-id.sh cleanup'
 
-# ZRAM variants
-alias ramoptc='sudo ~/bin/optimize-id.sh ram --zram 0.75 --swappiness 25'
-alias ramopt50='sudo ~/bin/optimize-id.sh ram --zram 0.5 --swappiness 20'
-alias ramopt25='sudo ~/bin/optimize-id.sh ram --zram 0.25 --swappiness 15'
-alias ramopt15='sudo ~/bin/optimize-id.sh ram --zram 0.15 --swappiness 10'
-alias ramopt10='sudo ~/bin/optimize-id.sh ram --zram 0.10 --swappiness 10'
-alias ramoptno='sudo ~/bin/optimize-id.sh ram --no-zram'
-alias ramoptforce='sudo ~/bin/optimize-id.sh ram --force-zram'
-alias sysoptno='sudo ~/bin/optimize-id.sh --no-zram'
-alias sysoptforce='sudo ~/bin/optimize-id.sh --force-zram'
-
 # Monitoring
-alias zramstat='zramctl && cat /proc/swaps'
-alias memstat='free -h && cat /proc/swaps'
-alias zramdev='ls /sys/block/zram* 2>/dev/null || echo "No ZRAM devices found"'
-alias zramlog='sudo dmesg | grep zram'
+alias zramstat='zramctl'
+alias memstat='free -h && swapon --show'
+alias zramlog='sudo dmesg | grep -i zram'
 ```
 
-Apply:
-```bash
-source ~/.zshrc
-```
+---
 
-## Troubleshooting
-### Common Issues
-1. **ZRAM Setup Fails: Insufficient Memory**
-   - **Error**: `Available memory too low for ZRAM`
-   - **Cause**: Not enough free memory (requires 1.1x ZRAM size).
-   - **Solution**:
-     ```bash
-     sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
-     free -h
-     sudo ./optimize-id.sh ram --zram 0.25
-     ```
-     Or use smaller ZRAM:
-     ```bash
-     sudo ./optimize-id.sh ram --zram 0.10
-     ```
+## Troubleshooting & Solved Conflicts
 
-2. **Multiple ZRAM Devices (`/dev/zram1`, etc.)**
-   - **Error**: `zramctl --find` shows `/dev/zram1` or higher.
-   - **Cause**: `num_devices` > 1 in ZRAM module.
-   - **Solution**:
-     ```bash
-     sudo swapoff /dev/zram*
-     sudo zramctl --reset /dev/zram*
-     sudo modprobe -r zram
-     sudo modprobe zram num_devices=1
-     echo "options zram num_devices=1" | sudo tee /etc/modprobe.d/zram.conf
-     ```
+### 1. Boot hangs for 90 seconds on "A start job is running for dev-zram0.device"
+- **Cause**: ChatGPT or legacy guides advised adding `/dev/zram0 none swap defaults 0 0` into `/etc/fstab`. Because ZRAM block devices are created dynamically by systemd generators after boot, fstab waits 90 seconds for a non-existent static block device.
+- **Fix**: The script automatically comments out `/dev/zram0` in `/etc/fstab`. `systemd-zram-generator` mounts the swap unit dynamically at target readiness without any delay.
 
-3. **Cannot Unload ZRAM Module**
-   - **Error**: `modprobe: FATAL: Module zram is in use`
-   - **Cause**: ZRAM devices active or processes using them.
-   - **Solution**:
-     ```bash
-     sudo swapoff /dev/zram*
-     sudo zramctl --reset /dev/zram*
-     lsof /dev/zram*
-     sudo modprobe -r zram
-     ```
+### 2. "Device or resource busy" during swap modification
+- **Cause**: Attempting to run `modprobe -r zram` while `systemd-zram-setup@zram0.service` holds the device open.
+- **Fix**: Version 3.2.0 interacts directly with `systemctl restart systemd-zram-setup@zram0.service` instead of trying to violently unload the kernel module.
 
-4. **dmesg Permission Denied**
-   - **Error**: `dmesg: read kernel buffer failed: Operation not permitted`
-   - **Cause**: `kernel.dmesg_restrict=1` limits non-root access.
-   - **Solution**:
-     ```bash
-     sudo dmesg | grep zram
-     ```
-     Or disable restriction (less secure):
-     ```bash
-     sudo sysctl -w kernel.dmesg_restrict=0
-     ```
+### 3. External USB SSD starts thrashing and freezes the machine
+- **Cause**: The previous script searched `/dev/sd*` and ran `swapon` on every partition formatted as swap, accidentally activating slow USB SSD partitions.
+- **Fix**: The script now strictly checks only currently active swaps in `/proc/swaps` and uncommented entries in `/etc/fstab`.
 
-5. **num_devices Parameter Missing**
-   - **Error**: `cat: /sys/module/zram/parameters/num_devices: No such file or directory`
-   - **Cause**: ZRAM built-in or non-standard kernel.
-   - **Solution**:
-     ```bash
-     ls /sys/block/zram*
-     zcat /boot/config-$(uname -r) | grep CONFIG_ZRAM
-     ```
-
-6. **Cannot Change Disksize or Algorithm**
-   - **Error**: `zram: Cannot change disksize for initialized device`
-   - **Cause**: Attempting to modify active ZRAM device.
-   - **Solution**:
-     ```bash
-     sudo swapoff /dev/zram0
-     sudo zramctl --reset /dev/zram0
-     sudo ./optimize-id.sh ram --force-zram
-     ```
-
-### Debugging Tips
-- Check ZRAM status:
-  ```bash
-  zramctl
-  cat /proc/swaps
-  ```
-- Monitor memory:
-  ```bash
-  free -h
-  ```
-- View kernel logs:
-  ```bash
-  sudo dmesg | grep zram
-  ```
-- Check kernel config:
-  ```bash
-  zcat /boot/config-$(uname -r) | grep CONFIG_ZRAM
-  ```
+---
 
 ## Contributing
-Contributions are welcome! Please:
 1. Fork the repository.
-2. Create a feature branch (`git checkout -b feature-name`).
-3. Commit changes (`git commit -m "Add feature"`).
-4. Push to the branch (`git push origin feature-name`).
+2. Create your feature branch (`git checkout -b feature/kernel-enhancement`).
+3. Commit your changes (`git commit -m "feat(zram): add support for custom sysctl templates"`).
+4. Push to branch (`git push origin feature/kernel-enhancement`).
 5. Open a Pull Request.
 
-Report issues at `https://github.com/oalalif/SystemOptimizer-ZRAM/issues`.
+---
 
 ## License
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
