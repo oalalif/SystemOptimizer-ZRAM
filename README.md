@@ -24,7 +24,7 @@ This script tunes Linux systems for peak responsiveness and memory efficiency:
 - **I/O Scheduler Optimization**: Direct NVMe `none` bypass, MQ-Deadline for SSDs/HDDs.
 - **System Debloat**: Safe cleanup of package caches (APT/DNF/Pacman) and vacuuming systemd journal logs.
 
-**Current Version**: `3.2.0` (Native `systemd-zram-generator` integration, `zstd` 4x compression, dynamic allocation fix, safe secondary swap management).
+**Current Version**: `3.2.1` (Native `systemd-zram-generator` integration, `zstd` 4x compression, automated conflict resolution for `zswap`/`zram-config`/`zramswap`, safe secondary swap management).
 
 ---
 
@@ -158,6 +158,14 @@ alias zramlog='sudo dmesg | grep -i zram'
 ### 3. External USB SSD starts thrashing and freezes the machine
 - **Cause**: The previous script searched `/dev/sd*` and ran `swapon` on every partition formatted as swap, accidentally activating slow USB SSD partitions.
 - **Fix**: The script now strictly checks only currently active swaps in `/proc/swaps` and uncommented entries in `/etc/fstab`.
+
+### 4. Conflicting ZRAM Daemons (`zram-config` & `zram-tools` fighting `systemd-zram-generator`)
+- **Cause**: Having legacy packages like `zram-config` or `zram-tools` installed alongside `systemd-zram-generator` causes multiple services to compete for `/dev/zram0` on boot, overriding compression settings, resetting priority down to 5, and allocating fragmented devices per core.
+- **Fix**: Version 3.2.1 automatically checks, stops, disables, and masks `zram-config.service` and `zramswap.service`. For complete cleanup on Ubuntu/Debian, run: `sudo apt purge -y zram-config zram-tools`.
+
+### 5. Kernel `zswap` Redundant Double Compression
+- **Cause**: Kernel `zswap` intercepts memory pages and compresses them before swapping them out. When swapping to ZRAM, pages end up being compressed twice (once in zswap and once in zram), producing high CPU spikes and memory latency.
+- **Fix**: Version 3.2.1 detects active `zswap` and automatically sets `/sys/module/zswap/parameters/enabled` to `0`. To permanently disable it across reboots, add `zswap.enabled=0` to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub` and run `sudo update-grub`.
 
 ---
 

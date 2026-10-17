@@ -2,8 +2,9 @@
 # ==============================================================================
 # System Optimizer Script - Versi Modern & Sinkronisasi Arsitektur Ubuntu
 # Optimasi RAM (ZRAM zstd/Generator), CPU Scheduler, Disk I/O, dan Cleanup Sistem
-# Version: 3.2.0 - systemd-zram-generator integration, zstd 4x compression,
-#                  safe swap detection, anti-thrash kernel tuning
+# Version: 3.2.1 - systemd-zram-generator integration, zstd 4x compression,
+#                  conflict resolution (zswap/zram-config/zramswap),
+#                  safe swap priority detection, anti-thrash kernel tuning
 # ==============================================================================
 set -euo pipefail
 
@@ -68,7 +69,7 @@ EXAMPLES:
     sudo ./optimize-id.sh                   # Optimasi penuh standar modern
     sudo ./optimize-id.sh ram               # RAM & ZRAM (100% RAM, zstd, swappiness 180)
     sudo ./optimize-id.sh ram --zram 0.5    # ZRAM 50% RAM
-    sudo ./optimize-id.sh ram --no-zram     # RAM tanpa ZRAM
+    sudo ./optimize-id.sh ram --no-zram     # RAM tanpa ZRAM (swappiness konservatif 60)
     sudo ./optimize-id.sh cleanup           # Hanya pembersihan cache & temporary
 EOF
 }
@@ -77,6 +78,7 @@ EOF
 MODE="all"
 ZRAM_PERCENT=1.0
 SWAPPINESS=180
+SWAPPINESS_CUSTOM=false
 PREFERRED_ALGO="zstd"
 SKIP_ZRAM=false
 FORCE_ZRAM=false
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --swappiness)
             SWAPPINESS="$2"
+            SWAPPINESS_CUSTOM=true
             shift 2
             ;;
         --algorithm)
@@ -112,7 +115,7 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            log "❌ Opsi tidak dikenal: $1"
+            log "${RED}❌ Opsi tidak dikenal: $1${NC}"
             show_help
             exit 1
             ;;
@@ -123,11 +126,11 @@ done
 validate_zram() {
     local value="$1"
     if ! [[ $value =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        log "❌ Persentase ZRAM harus berupa angka desimal atau bulat (misalnya: 0.5, 1.0, 1.25)"
+        log "${RED}❌ Persentase ZRAM harus berupa angka desimal atau bulat (misalnya: 0.5, 1.0, 1.25)${NC}"
         return 1
     fi
     if (( $(echo "$value < 0.1 || $value > 1.5" | bc -l) )); then
-        log "❌ Persentase ZRAM harus berada di antara 0.1 s/d 1.5"
+        log "${RED}❌ Persentase ZRAM harus berada di antara 0.1 s/d 1.5${NC}"
         return 1
     fi
     return 0
@@ -137,7 +140,7 @@ validate_zram() {
 validate_swappiness() {
     local value="$1"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -gt 200 ]]; then
-        log "❌ Swappiness harus berupa angka bulat di antara 0 s/d 200"
+        log "${RED}❌ Swappiness harus berupa angka bulat di antara 0 s/d 200${NC}"
         return 1
     fi
     return 0
@@ -147,19 +150,19 @@ validate_swappiness() {
 check_zram_support() {
     log "🔍 Mengecek dukungan ZRAM di kernel..."
     if [[ -f /proc/config.gz ]] && zcat /proc/config.gz | grep -q "CONFIG_ZRAM="; then
-        log "✅ ZRAM didukung (built-in kernel)"
+        log "${GREEN}✅ ZRAM didukung (built-in kernel)${NC}"
         return 0
-    elif [[ -f /boot/config-$(uname -r) ]] && grep -q "CONFIG_ZRAM" /boot/config-$(uname -r); then
-        log "✅ ZRAM didukung (konfigurasi kernel)"
+    elif [[ -f /boot/config-"$(uname -r)" ]] && grep -q "CONFIG_ZRAM" /boot/config-"$(uname -r)"; then
+        log "${GREEN}✅ ZRAM didukung (konfigurasi kernel)${NC}"
         return 0
     elif modinfo zram >/dev/null 2>&1; then
-        log "✅ ZRAM modul kernel tersedia"
+        log "${GREEN}✅ ZRAM modul kernel tersedia${NC}"
         return 0
     elif [[ -d /sys/module/zram ]]; then
-        log "✅ Modul ZRAM aktif"
+        log "${GREEN}✅ Modul ZRAM aktif${NC}"
         return 0
     else
-        log "❌ ZRAM tidak didukung oleh kernel saat ini"
+        log "${RED}❌ ZRAM tidak didukung oleh kernel saat ini${NC}"
         return 1
     fi
 }
@@ -169,25 +172,59 @@ check_available_memory() {
     local zram_size=$1
     sync
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    local free_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    local free_mem_kb
+    free_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
     if [[ $free_mem_kb -lt 65536 ]]; then
-        log "⚠️ Memori tersedia ($((free_mem_kb/1024))MB) sangat kritis. Tidak aman menginisialisasi ZRAM."
+        log "${YELLOW}⚠️ Memori tersedia ($((free_mem_kb/1024))MB) sangat kritis. Tidak aman menginisialisasi ZRAM.${NC}"
         return 1
     fi
-    log "✅ Memori mencukupi untuk inisialisasi ZRAM (tersedia: $((free_mem_kb/1024))MB, target pool virtual: $((zram_size/1024/1024))MB)"
+    log "${GREEN}✅ Memori mencukupi untuk inisialisasi ZRAM (tersedia: $((free_mem_kb/1024))MB, target pool virtual: $((zram_size/1024/1024))MB)${NC}"
     return 0
 }
 
 # Deteksi ketersediaan systemd-zram-generator
 is_systemd_zram_generator_present() {
-    if [[ -x /usr/lib/systemd/system-generators/zram-generator ]] || \
+    if [[ -x /usr/lib/systemd/system-generators/zram-generator || -x /lib/systemd/system-generators/zram-generator ]] || \
        systemctl list-unit-files 2>/dev/null | grep -q "systemd-zram-setup"; then
         return 0
     fi
     return 1
 }
 
-# Pembersihan ZRAM aman tanpa memicu crash kernel / freeze
+# Resolusi konflik ZRAM: nonaktifkan paket/layanan lawas & zswap yang saling bertabrakan
+resolve_zram_conflicts() {
+    log "🛡 Memeriksa dan menyelesaikan konflik layanan ZRAM & zswap..."
+
+    # 1. Nonaktifkan kernel zswap jika aktif (mencegah double-compression thrashing dengan ZRAM)
+    if [[ -f /sys/module/zswap/parameters/enabled ]]; then
+        local zswap_state
+        zswap_state=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo "N")
+        if [[ "$zswap_state" == "Y" || "$zswap_state" == "1" ]]; then
+            echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+            log "  -> ${YELLOW}Kernel zswap dinonaktifkan (eliminasi double-compression dengan ZRAM).${NC}"
+        fi
+    fi
+
+    # 2. Hentikan dan masking layanan zram lama yang sering bertabrakan
+    local conflicting_services=("zram-config.service" "zramswap.service" "zram-unit.service")
+    for svc in "${conflicting_services[@]}"; do
+        if systemctl is-active "$svc" >/dev/null 2>&1 || systemctl is-enabled "$svc" >/dev/null 2>&1; then
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            systemctl mask "$svc" 2>/dev/null || true
+            log "  -> ${YELLOW}Layanan konflik '$svc' telah dihentikan dan dimasking.${NC}"
+        fi
+    done
+
+    # 3. Bersihkan entri statis di /etc/fstab yang memicu timeout booting 90 detik
+    local FSTAB="/etc/fstab"
+    if grep -q "^/dev/zram0" "$FSTAB" 2>/dev/null; then
+        sed -i 's|^/dev/zram0|# /dev/zram0 (dikelola otomatis oleh systemd-zram-generator)|g' "$FSTAB"
+        log "  -> ${GREEN}Entri statis /dev/zram0 dinonaktifkan dari fstab (mencegah delay booting 90s).${NC}"
+    fi
+}
+
+# Pembersihan ZRAM aman standalone tanpa memicu crash kernel / freeze
 cleanup_zram_standalone() {
     log "===== Membersihkan ZRAM (Standalone Mode) ====="
     
@@ -196,7 +233,11 @@ cleanup_zram_standalone() {
         while read -r swap_dev; do
             if [[ "$swap_dev" =~ /dev/zram[0-9]* ]]; then
                 if [[ -b "$swap_dev" ]]; then
-                    swapoff "$swap_dev" 2>/dev/null && log "✅ Matikan swap: $(basename "$swap_dev")" || log "⚠ Gagal swapoff: $(basename "$swap_dev")"
+                    if swapoff "$swap_dev" 2>/dev/null; then
+                        log "✅ Matikan swap: $(basename "$swap_dev")"
+                    else
+                        log "⚠ Gagal swapoff: $(basename "$swap_dev")"
+                    fi
                 fi
             fi
         done < <(swapon --show=NAME --noheadings)
@@ -209,7 +250,8 @@ cleanup_zram_standalone() {
         if [[ -n "$zram_devices" ]]; then
             echo "$zram_devices" | while read -r zram_dev; do
                 if [[ -n "$zram_dev" && -b "$zram_dev" ]]; then
-                    zramctl --reset "$zram_dev" 2>/dev/null && log "✅ Reset: $(basename "$zram_dev")" || true
+                    zramctl --reset "$zram_dev" 2>/dev/null || true
+                    log "✅ Reset: $(basename "$zram_dev")"
                 fi
             done
         fi
@@ -228,21 +270,25 @@ setup_zram() {
     fi
     
     if ! check_available_memory "$zram_size"; then
-        log "❌ Gagal menyiapkan ZRAM karena memori fisik kritis"
+        log "${RED}❌ Gagal menyiapkan ZRAM karena memori fisik kritis${NC}"
         return 1
+    fi
+
+    # Selesaikan konflik sebelum inisialisasi
+    resolve_zram_conflicts
+
+    # Jika --force-zram diaktifkan, lakukan pembersihan total perangkat & unit
+    if [[ "$FORCE_ZRAM" == "true" ]]; then
+        log "🔄 Menjalankan Force Reset ZRAM..."
+        systemctl stop dev-zram0.swap 2>/dev/null || true
+        systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+        cleanup_zram_standalone
     fi
 
     # 1. METODE UTAMA: systemd-zram-generator (Standar Modern Ubuntu / Fedora / Debian)
     if is_systemd_zram_generator_present; then
         log "⚙ Menggunakan arsitektur modern: systemd-zram-generator"
         
-        # Bersihkan potensi entri statis di /etc/fstab yang memicu boot hang 90 detik
-        local FSTAB="/etc/fstab"
-        if grep -q "^/dev/zram0" "$FSTAB" 2>/dev/null; then
-            sed -i 's|^/dev/zram0|# /dev/zram0 (dikelola otomatis oleh systemd-zram-generator)|g' "$FSTAB"
-            log "  -> Entri statis /dev/zram0 dinonaktifkan dari fstab (mencegah delay booting 90s)."
-        fi
-
         # Susun konfigurasi generator
         local gen_conf="/etc/systemd/zram-generator.conf"
         mkdir -p /etc/systemd
@@ -255,32 +301,28 @@ EOF
         log "  -> Menulis konfigurasi: $gen_conf (${zram_size_mb}MB, ${PREFERRED_ALGO}, priority 100)"
         
         systemctl daemon-reload
-        if systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || systemctl start /dev/zram0 2>/dev/null; then
-            log "✅ Layanan systemd-zram-setup@zram0 berhasil diaktifkan"
+        if systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || systemctl restart dev-zram0.swap 2>/dev/null || systemctl start /dev/zram0 2>/dev/null; then
+            log "${GREEN}✅ Layanan systemd-zram-setup@zram0 berhasil diaktifkan${NC}"
             sleep 1
             if swapon --show=NAME --noheadings | grep -q "/dev/zram0"; then
-                log "✅ /dev/zram0 aktif sebagai swap utama"
+                log "${GREEN}✅ /dev/zram0 aktif sebagai swap utama${NC}"
                 if command -v zramctl >/dev/null 2>&1; then
                     zramctl /dev/zram0 2>/dev/null | while read -r line; do log "   $line"; done
                 fi
                 return 0
             fi
         fi
-        log "⚠️ systemd-zram-generator restart gagal, mencoba fallback manual..."
+        log "${YELLOW}⚠️ systemd-zram-generator restart gagal, mencoba fallback manual...${NC}"
     fi
 
     # 2. METODE FALLBACK: Standalone zramctl / modprobe
     log "⚙ Menggunakan arsitektur fallback: zramctl standalone"
-    if [[ "$FORCE_ZRAM" == "true" ]]; then
-        cleanup_zram_standalone
-    fi
-
     if ! lsmod | grep -q "^zram"; then
         modprobe zram num_devices=1 >/dev/null 2>&1 || modprobe zram >/dev/null 2>&1 || true
     fi
 
     if ! command -v zramctl >/dev/null 2>&1; then
-        log "❌ Perintah zramctl tidak ditemukan untuk mode fallback"
+        log "${RED}❌ Perintah zramctl tidak ditemukan untuk mode fallback${NC}"
         return 1
     fi
 
@@ -297,7 +339,7 @@ EOF
             elif echo "$supported_algos" | grep -q "lzo-rle"; then
                 chosen_algo="lzo-rle"
             fi
-            log "ℹ Algoritma ${PREFERRED_ALGO} tidak didukung, menggunakan fallback: ${chosen_algo}"
+            log "${BLUE}ℹ Algoritma ${PREFERRED_ALGO} tidak didukung, menggunakan fallback: ${chosen_algo}${NC}"
         fi
     fi
 
@@ -316,12 +358,12 @@ EOF
     if [[ -n "$zram_dev" && -b "$zram_dev" ]]; then
         mkswap "$zram_dev" >/dev/null 2>&1
         swapon -p 100 "$zram_dev" >/dev/null 2>&1
-        log "✅ ZRAM aktif: ${zram_size_mb}MB (${chosen_algo}) pada $zram_dev (Prioritas 100)"
+        log "${GREEN}✅ ZRAM aktif: ${zram_size_mb}MB (${chosen_algo}) pada $zram_dev (Prioritas 100)${NC}"
         zramctl "$zram_dev" 2>/dev/null | while read -r line; do log "   $line"; done
         return 0
     fi
 
-    log "❌ Gagal menginisialisasi ZRAM melalui mode standalone"
+    log "${RED}❌ Gagal menginisialisasi ZRAM melalui mode standalone${NC}"
     return 1
 }
 
@@ -330,41 +372,75 @@ manage_swap_priorities() {
     log "===== Mengatur Prioritas Swap Non-ZRAM (Aman) ====="
     local swap_devices=()
 
-    # Hanya daftarkan swap yang aktif di /proc/swaps
+    # 1. Daftarkan swap yang aktif di /proc/swaps
     if [[ -f /proc/swaps ]]; then
         while read -r line; do
             if [[ "$line" =~ ^/[^[:space:]]+ ]]; then
                 local dev_name
                 dev_name=$(echo "$line" | awk '{print $1}')
-                if [[ ! "$dev_name" =~ /dev/zram[0-9]* && ! " ${swap_devices[*]} " =~ " $dev_name " ]]; then
-                    swap_devices+=("$dev_name")
+                if [[ ! "$dev_name" =~ /dev/zram[0-9]* ]]; then
+                    local already=false
+                    for existing in "${swap_devices[@]}"; do
+                        if [[ "$existing" == "$dev_name" ]]; then
+                            already=true
+                            break
+                        fi
+                    done
+                    if [[ "$already" == "false" ]]; then
+                        swap_devices+=("$dev_name")
+                    fi
                 fi
             fi
         done < /proc/swaps
     fi
 
-    # Dan swap yang secara sah tidak dikomentari di /etc/fstab
+    # 2. Daftarkan swap sah yang aktif di /etc/fstab (mountpoint bisa 'none' atau 'swap')
     if [[ -f /etc/fstab ]]; then
         while read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*(/[^[:space:]]+)[[:space:]]+swap[[:space:]]+swap ]]; then
+            if [[ "$line" =~ ^[[:space:]]*(/[^[:space:]]+)[[:space:]]+(none|swap)[[:space:]]+swap ]]; then
                 local fstab_dev="${BASH_REMATCH[1]}"
-                if [[ ! "$fstab_dev" =~ /dev/zram[0-9]* && ! " ${swap_devices[*]} " =~ " $fstab_dev " ]]; then
-                    swap_devices+=("$fstab_dev")
+                if [[ ! "$fstab_dev" =~ /dev/zram[0-9]* ]]; then
+                    local already=false
+                    for existing in "${swap_devices[@]}"; do
+                        if [[ "$existing" == "$fstab_dev" ]]; then
+                            already=true
+                            break
+                        fi
+                    done
+                    if [[ "$already" == "false" ]]; then
+                        swap_devices+=("$fstab_dev")
+                    fi
                 fi
             fi
         done < /etc/fstab
     fi
 
-    # Atur prioritas swap sekunder lebih rendah dari ZRAM (ZRAM = 100)
+    # Atur prioritas swap cadangan agar berada di bawah ZRAM (ZRAM = 100)
     for s_dev in "${swap_devices[@]}"; do
         if [[ -b "$s_dev" || -f "$s_dev" ]]; then
-            if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q "^$s_dev"; then
-                swapon "$s_dev" 2>/dev/null && log "✅ Mengaktifkan swap sekunder: $s_dev" || true
+            local target_prio=10
+            if [[ "$s_dev" =~ /dev/sd[a-z][0-9] || "$s_dev" =~ /dev/nvme ]]; then
+                target_prio=5
             fi
-            if [[ "$s_dev" =~ /swapfile[0-9]* ]]; then
-                swapoff "$s_dev" 2>/dev/null && swapon -p 10 "$s_dev" 2>/dev/null && log "📍 Prioritas $s_dev: 10 (Cadangan)" || true
-            elif [[ "$s_dev" =~ /dev/sd[a-z][0-9] ]]; then
-                swapoff "$s_dev" 2>/dev/null && swapon -p 5 "$s_dev" 2>/dev/null && log "📍 Prioritas partisi $s_dev: 5 (Cadangan)" || true
+
+            # Cek apakah sudah aktif
+            if swapon --show=NAME --noheadings 2>/dev/null | grep -q "^$s_dev"; then
+                # Cek prioritas saat ini
+                local cur_prio
+                cur_prio=$(swapon --show=NAME,PRIO --noheadings 2>/dev/null | awk -v d="$s_dev" '$1 == d {print $2}')
+                # Hanya sesuaikan jika prioritasnya bersaing dengan atau melebihi ZRAM (>=100)
+                if [[ -n "$cur_prio" && "$cur_prio" -ge 100 ]]; then
+                    log "  -> Menurunkan prioritas $s_dev ($cur_prio -> $target_prio)..."
+                    swapoff "$s_dev" 2>/dev/null || true
+                    swapon -p "$target_prio" "$s_dev" 2>/dev/null || true
+                else
+                    log "📍 Swap cadangan $s_dev sudah aktif dengan prioritas aman ($cur_prio < 100)"
+                fi
+            else
+                # Belum aktif, aktifkan langsung dengan prioritas rendah
+                if swapon -p "$target_prio" "$s_dev" 2>/dev/null; then
+                    log "${GREEN}✅ Mengaktifkan swap cadangan: $s_dev (Prioritas: $target_prio)${NC}"
+                fi
             fi
         fi
     done
@@ -386,7 +462,15 @@ optimize_ram() {
     local total_ram_gb=$(( total_ram_kb / 1024 / 1024 ))
     
     log "🖌 RAM Fisik Total: ${total_ram_gb}GB"
-    log "🔧 Menetapkan Swappiness: $swappiness (Tinggi untuk memaksimalkan kompresi ZRAM di RAM)"
+
+    if [[ "$SKIP_ZRAM" == "true" ]]; then
+        if [[ "$SWAPPINESS_CUSTOM" == "false" ]]; then
+            swappiness=60
+            log "${BLUE}ℹ ZRAM dilewati (--no-zram); swappiness disetel ke default konservatif (60) untuk mencegah thrashing disk swap.${NC}"
+        fi
+    fi
+    
+    log "🔧 Menetapkan Swappiness: $swappiness"
     sysctl vm.swappiness="$swappiness" >/dev/null
     
     if [[ "$SKIP_ZRAM" == "true" ]]; then
@@ -400,9 +484,9 @@ optimize_ram() {
         log "📏 Target Kapasitas Pool ZRAM: ${zram_size_mb}MB (${zram_percent_int}% dari RAM fisik)"
         
         if setup_zram "$zram_size"; then
-            log "✅ Pool kompresi ZRAM beroperasi sempurna"
+            log "${GREEN}✅ Pool kompresi ZRAM beroperasi sempurna${NC}"
         else
-            log "⚠ Setup ZRAM gagal, melanjutkan optimasi subsistem memori lainnya"
+            log "${YELLOW}⚠ Setup ZRAM gagal, melanjutkan optimasi subsistem memori lainnya${NC}"
         fi
     fi
     
@@ -427,11 +511,11 @@ optimize_ram() {
     
     # Simpan konfigurasi sysctl permanen jika direktori tersedia
     if [[ -d /etc/sysctl.d ]]; then
-        cat << 'EOF' > /etc/sysctl.d/99-zram-performance.conf
+        cat << EOF > /etc/sysctl.d/99-zram-performance.conf
 # ==============================================================================
 # Anti-Freeze & ZRAM High-Throughput Memory Settings
 # ==============================================================================
-vm.swappiness = 180
+vm.swappiness = ${swappiness}
 vm.page-cluster = 0
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 10
@@ -439,10 +523,10 @@ vm.dirty_background_ratio = 5
 vm.watermark_boost_factor = 0
 vm.watermark_scale_factor = 125
 EOF
-        log "💾 Konfigurasi permanen tersimpan di /etc/sysctl.d/99-zram-performance.conf"
+        log "${GREEN}💾 Konfigurasi permanen tersimpan di /etc/sysctl.d/99-zram-performance.conf${NC}"
     fi
 
-    log "✅ Optimasi RAM & VM selesai"
+    log "${GREEN}✅ Optimasi RAM & VM selesai${NC}"
 }
 
 # Optimasi CPU & I/O Scheduler
@@ -498,7 +582,7 @@ optimize_cpu() {
         fi
     done 2>/dev/null || true
     
-    log "✅ Optimasi CPU & Disk I/O selesai"
+    log "${GREEN}✅ Optimasi CPU & Disk I/O selesai${NC}"
 }
 
 # Pembersihan cache & file sisa
@@ -511,15 +595,21 @@ cleanup_system() {
     
     log "🗑 Membersihkan paket & arsip package manager..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean >/dev/null 2>&1 && apt-get clean >/dev/null 2>&1 && log "✅ APT cleanup selesai" || true
+        if apt-get autoremove -y >/dev/null 2>&1 && apt-get autoclean >/dev/null 2>&1 && apt-get clean >/dev/null 2>&1; then
+            log "${GREEN}✅ APT cleanup selesai${NC}"
+        fi
     fi
     
     if command -v dnf >/dev/null 2>&1; then
-        dnf autoremove -y >/dev/null 2>&1 && dnf clean all >/dev/null 2>&1 && log "✅ DNF cleanup selesai" || true
+        if dnf autoremove -y >/dev/null 2>&1 && dnf clean all >/dev/null 2>&1; then
+            log "${GREEN}✅ DNF cleanup selesai${NC}"
+        fi
     fi
     
     if command -v pacman >/dev/null 2>&1; then
-        pacman -Sc --noconfirm >/dev/null 2>&1 && log "✅ Pacman cleanup selesai" || true
+        if pacman -Sc --noconfirm >/dev/null 2>&1; then
+            log "${GREEN}✅ Pacman cleanup selesai${NC}"
+        fi
     fi
     
     log "📂 Membersihkan file sementara & vacuum systemd journal..."
@@ -529,7 +619,7 @@ cleanup_system() {
         journalctl --vacuum-time=7d >/dev/null 2>&1 || true
         journalctl --vacuum-size=50M >/dev/null 2>&1 || true
     } || true
-    log "✅ Cleanup selesai"
+    log "${GREEN}✅ Cleanup selesai${NC}"
 }
 
 # Tampilkan status ringkasan
@@ -559,7 +649,7 @@ show_status() {
     fi
     
     local load_avg
-    load_avg=$(cat /proc/loadavg | cut -d' ' -f1-3)
+    load_avg=$(cut -d' ' -f1-3 /proc/loadavg)
     log "📈 Load Average: $load_avg"
 }
 
@@ -585,4 +675,4 @@ case "$MODE" in
 esac
 
 show_status
-log "🎉 Seluruh proses optimasi berhasil dieksekusi!"
+log "${GREEN}🎉 Seluruh proses optimasi berhasil dieksekusi!${NC}"
